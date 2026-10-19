@@ -63,8 +63,11 @@ def main():
     # must be re-run once to record it)
     ff_parent = state.get('ff_parent')
     if ff_parent:
-        os.environ['GMXLIB'] = (ff_parent + os.pathsep
-                                + os.environ.get('GMXLIB', ''))
+        # no empty components -- GROMACS aborts on them (see setup script)
+        _gmxlib = [ff_parent] + [p for p in
+                                 os.environ.get('GMXLIB', '').split(os.pathsep)
+                                 if p]
+        os.environ['GMXLIB'] = os.pathsep.join(_gmxlib)
     else:
         print('[run] WARNING: state.json has no ff_parent; if grompp cannot '
               'find the force field, re-run setup_asyn_aa.py once', flush=True)

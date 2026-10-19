@@ -264,6 +264,8 @@ def main():
     if state.get('build') and os.path.isfile(start_pdb):
         print('[setup] build: done, skipping')
     else:
+        if not os.path.isfile(start_pdb):
+            state['build'] = False  # checkpoint lied; structure is gone
         if os.path.isfile(start_pdb):
             # adopt a leftover start structure if it already fits the box
             # (e.g. collapse finished but a later stage failed before the
@@ -296,8 +298,12 @@ def main():
     # ions grompp): topol.top includes the FF by relative name, resolved via
     # cwd/GMXLIB/GMXDATA -- and cwd is the replica dir, so GMXLIB is required.
     ff_parent = os.path.dirname(os.path.abspath(args.ff_dir))
-    os.environ['GMXLIB'] = (ff_parent + os.pathsep
-                            + os.environ.get('GMXLIB', ''))
+    # NOTE: never leave empty components in GMXLIB (e.g. a trailing colon
+    # when GMXLIB was unset) -- GROMACS >= 2026 aborts with
+    # "Attempted to open empty/null directory path" when it hits one.
+    _gmxlib = [ff_parent] + [p for p in
+                             os.environ.get('GMXLIB', '').split(os.pathsep) if p]
+    os.environ['GMXLIB'] = os.pathsep.join(_gmxlib)
     if state.get('pdb2gmx') and os.path.isfile(os.path.join(rep, 'conf.gro')):
         print('[setup] pdb2gmx: done, skipping')
     else:
