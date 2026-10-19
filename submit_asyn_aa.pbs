@@ -1,0 +1,99 @@
+#!/usr/bin/env bash
+#PBS -N asyn_aa
+#PBS -P 11004456
+#PBS -q normal
+#PBS -l select=1:ncpus=16:ngpus=2
+#PBS -l walltime=24:00:00
+#PBS -j oe
+# ============================================================================
+# alpha-synuclein all-atom MD campaign (a99SB-disp / TIP4P-Disp, 16 nm box,
+# 300 K / 1 atm / 150 mM NaCl) -- NSCC ASPIRE 2A. Tuned from submit_panel3.sh.
+#
+# Submit from the repo dir (or override REPO):
+#   qsub -v PHASE=smoke,REPO="$PWD" submit_asyn_aa.pbs   # 1 replica x 1 ns; run FIRST
+#   qsub -v PHASE=setup,REPO="$PWD" submit_asyn_aa.pbs   # build all systems, no MD
+#   qsub -v PHASE=run,REPO="$PWD"   submit_asyn_aa.pbs   # production campaign
+#
+# Knobs (qsub -v): REPLICAS=4 | 1-8, US (us per replica), MAXH (chunk hours,
+# default 23.5 < walltime), RETRIES, NTOMP, FF_DIR, GMX_MODULE, ENV_PREFIX.
+#
+# Scale-out: submit several run jobs with DISJOINT replica ranges, e.g.
+#   qsub -v "PHASE=run,REPLICAS=1-4" submit_asyn_aa.pbs
+#   qsub -v "PHASE=run,REPLICAS=5-8" submit_asyn_aa.pbs
+# NEVER let two jobs share a replica number: same run dir, same prod.cpt,
+# two mdruns appending at once = corrupted checkpoint.
+#
+# Everything is resumable: a walltime kill means resubmit the identical
+# command; finished stages are skipped, production resumes from prod.cpt.
+# Edited on Windows? fix line breaks first:  sed -i 's/\r$//' submit_asyn_aa.pbs
+# ============================================================================
+set -euo pipefail
+
+PHASE="${PHASE:-smoke}"
+case "$PHASE" in smoke|setup|run) ;; *)
+    echo "FATAL: PHASE must be smoke|setup|run (got '$PHASE')" >&2
+    exit 2 ;;
+esac
+
+SCRATCH="${SCRATCH:-/scratch/users/industry/ism/behjoo}"
+ENV_PREFIX="${ENV_PREFIX:-$SCRATCH/conda-envs/asyn-aa}"   # see README: conda section
+REPO="${REPO:-$SCRATCH/asyn_allatom}"
+FF_DIR="${FF_DIR:-$REPO/a99SBdisp.ff}"
+GMX_MODULE="${GMX_MODULE:-gromacs}"        # MUST be the cluster's GPU build
+REPLICAS="${REPLICAS:-4}"
+US="${US:-1.0}"
+MAXH="${MAXH:-23.5}"
+RETRIES="${RETRIES:-2}"
+
+# caches on scratch (batch jobs do not read ~/.bashrc)
+export PIP_CACHE_DIR="$SCRATCH/pipcache" TMPDIR="$SCRATCH/tmp" XDG_CACHE_HOME="$SCRATCH/cache"
+
+source "$(conda info --base)/etc/profile.d/conda.sh"
+conda activate "$ENV_PREFIX"
+module load "$GMX_MODULE" 2>/dev/null \
+    || echo "WARN: 'module load $GMX_MODULE' failed -- relying on PATH"
+cd "$REPO"
+
+# knobs follow the actual allocation
+GPUS="$(nvidia-smi -L 2>/dev/null | grep -c '^GPU' || echo 1)"
+GPU_LIST="$(seq -s, 0 $((GPUS - 1)))"
+NCPU="${NCPUS:-16}"                        # PBS Pro exports NCPUS
+NTOMP="${NTOMP:-$(( NCPU / GPUS > 0 ? NCPU / GPUS : 1 ))}"
+
+echo "== asyn-aa job =="
+echo "  job     : ${PBS_JOBID:-interactive}"
+echo "  node    : $(hostname)   phase: $PHASE   gpus: $GPUS ($GPU_LIST)   ntomp/replica: $NTOMP"
+echo "  replicas: $REPLICAS   us/replica: $US   maxh: $MAXH   retries: $RETRIES"
+nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader || true
+
+echo "== pre-flight =="
+command -v gmx >/dev/null 2>&1 || {
+    echo "FATAL: gmx not found on PATH -- set GMX_MODULE=<cluster GPU module>" >&2
+    exit 1; }
+which gmx
+gmx --version | grep -iE 'gromacs version|cuda|gpu support' || true
+[ -d "$FF_DIR" ] || {
+    echo "FATAL: a99SBdisp.ff not found at $FF_DIR" >&2
+    echo "       (README: get the port from DESRES resources or a Kragelund repo)" >&2
+    exit 1; }
+python3 -c "import openmm, PeptideBuilder; print('openmm', openmm.__version__, '| PeptideBuilder ok')"
+
+echo "== provenance =="
+gmx --version | head -3
+python3 -c "import sys, openmm; print('python', sys.version.split()[0], '| openmm', openmm.__version__)"
+git log --oneline -1 2>/dev/null || echo "(repo not under git)"
+
+case "$PHASE" in
+    smoke)  python3 launch_asyn_aa.py --replicas 1 --gpus "${GPU_LIST%%,*}" \
+                --us "${SMOKE_US:-0.001}" --maxh 1 --ntomp "$NTOMP" --ff-dir "$FF_DIR" ;;
+    setup)  python3 launch_asyn_aa.py --replicas "$REPLICAS" --gpus "$GPU_LIST" \
+                --us "$US" --setup-only --ff-dir "$FF_DIR" ;;
+    run)    python3 launch_asyn_aa.py --replicas "$REPLICAS" --gpus "$GPU_LIST" \
+                --us "$US" --maxh "$MAXH" --ntomp "$NTOMP" \
+                --retries "$RETRIES" --ff-dir "$FF_DIR" ;;
+esac
+
+echo "== done: $PHASE =="
+echo "REMINDER: scratch purges at 30 days -- copy runs/repNN/ back now."
+echo "          prod.xtc contains FULL SOLVENT: strip water (gmx trjconv)"
+echo "          before archiving; it shrinks the trajectory by ~90%."
