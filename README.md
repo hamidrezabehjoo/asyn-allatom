@@ -18,13 +18,33 @@ checkpoint resume at every stage and one replica per GPU.
 ## Prerequisites
 
 1. GROMACS (2021+; 2024+ if you want HMR/4 fs — see comment in `prod.mdp`).
-2. The `a99SBdisp.ff` GROMACS port — not pip-installable; get it from the
-   DESRES resources page or a Kragelund-group IDP repository, and place it
-   next to these scripts (or pass `--ff-dir`). The TIP4P-Disp water model
-   is auto-detected from the port's `watermodels.dat`.
+2. The `a99SBdisp.ff` GROMACS port — not pip-installable. Use the official
+   Robustelli-lab distribution (GROMACS format, complete with residue
+   templates, c22 ions, and the a99SBdisp water box):
+
+   ```bash
+   git clone --depth 1 https://github.com/paulrobustelli/Force-Fields
+   cp -r Force-Fields/Gromacs_FFs/a99SBdisp.ff /path/to/this/repo/
+   ```
+
+   Place it next to these scripts (or pass `--ff-dir`). The water keyword in
+   this port is `a99SBdisp_water` (TIP4P-D with increased C6) and is
+   auto-detected from the port's `watermodels.dat`; the shipped
+   `a99SBdisp_water.gro` is used as the solvation box. Cite Robustelli,
+   Piana & Shaw, PNAS 115, E4758 (2018) and Piana et al., JPCB 119, 5113
+   (2015).
+
+   Note: on GROMACS >= 2026, `pdb2gmx -water` rejects custom water keywords
+   (the allowed-values list only covers the stock models, even when the
+   custom force field itself is found via GMXLIB). The setup detects this
+   and falls back automatically: interactive stdin selection, then a
+   `-water tip4p` + topology-include patch. Watch `setup.log` for which
+   strategy succeeded.
 3. Python deps (start builder + analysis): `openmm PeptideBuilder biopython
-   numpy mdtraj` — see the conda section below (a GPU node is recommended
-   for the collapse, CPU works but is slow).
+   numpy mdtraj` — see the conda section below. The collapse tries
+   CUDA -> OpenCL -> CPU and keeps the first platform that actually runs
+   (a broken CUDA plugin is skipped automatically); CPU is fine for a
+   140-residue chain (~10-30 min on 16 cores).
 
 ## Conda environment (install into scratch)
 

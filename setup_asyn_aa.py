@@ -160,6 +160,32 @@ def sh(cmd, cwd, dry, log, env=None):
                  f'        see {log.name}')
 
 
+def _ca_span_nm(pdb_path):
+    """(Rg nm, max CA-CA distance nm, n_CA) -- stdlib only, so the
+    adopt-existing-start check cannot die on missing heavy deps."""
+    import math
+    xyz = []
+    with open(pdb_path) as fh:
+        for ln in fh:
+            if ln.startswith('ATOM') and ln[12:16].strip() == 'CA':
+                xyz.append((float(ln[30:38]), float(ln[38:46]),
+                            float(ln[46:54])))
+    n = len(xyz)
+    cx = sum(p[0] for p in xyz) / n
+    cy = sum(p[1] for p in xyz) / n
+    cz = sum(p[2] for p in xyz) / n
+    rg2 = sum((p[0] - cx) ** 2 + (p[1] - cy) ** 2 + (p[2] - cz) ** 2
+              for p in xyz) / n
+    d2max = 0.0
+    for i in range(n):
+        for j in range(i + 1, n):
+            d2 = ((xyz[i][0] - xyz[j][0]) ** 2 + (xyz[i][1] - xyz[j][1]) ** 2
+                  + (xyz[i][2] - xyz[j][2]) ** 2)
+            if d2 > d2max:
+                d2max = d2
+    return math.sqrt(rg2) / 10.0, math.sqrt(d2max) / 10.0, n
+
+
 def find_ff(ff_dir):
     """Locate a99SBdisp.ff and auto-detect its TIP4P-Disp water keyword."""
     if not os.path.isdir(ff_dir):
@@ -175,7 +201,7 @@ def find_ff(ff_dir):
                 ln = ln.strip()
                 if ln and not ln.startswith(('#', ';')):
                     waters.append(ln.split()[0])
-    disp = [w for w in waters if re.search(r'tip4p.*dis|dis.*tip4p', w, re.I)]
+    disp = [w for w in waters if re.search(r'tip4p.*dis|dis.*tip4p|disp', w, re.I)]
     return disp[0] if disp else (waters[0] if waters else None), waters
 
 
@@ -213,6 +239,12 @@ def main():
     state = json.load(open(state_path)) if os.path.isfile(state_path) else {}
     log = open(os.path.join(rep, 'setup.log'), 'a')
 
+    def save_state():
+        """Persist stage checkpoints after EVERY stage, so a retry after a
+        late failure (e.g. pdb2gmx) does not redo the expensive collapse."""
+        with open(state_path, 'w') as f:
+            json.dump(state, f, indent=2)
+
     seed = 1000 + args.replica  # per-replica seed = f(index) only (no string games)
     dt_ps = 0.002
     total_steps = int(round(args.us * 1e6 / dt_ps))
@@ -232,11 +264,25 @@ def main():
     if state.get('build') and os.path.isfile(start_pdb):
         print('[setup] build: done, skipping')
     else:
-        sh([sys.executable, os.path.join(HERE, 'build_start.py'),
-            '--seed', str(seed), '--out', start_pdb,
-            '--box-nm', str(args.box_nm), '--platform', args.build_platform],
-           rep, args.dry_run, log)
-        state['build'] = True
+        if os.path.isfile(start_pdb):
+            # adopt a leftover start structure if it already fits the box
+            # (e.g. collapse finished but a later stage failed before the
+            # checkpoint was written)
+            try:
+                rg0, dmax0, _ = _ca_span_nm(start_pdb)
+            except Exception:
+                rg0, dmax0 = 0.0, None
+            if dmax0 is not None and dmax0 < args.box_nm - 2.0:
+                print(f'[setup] adopting existing start.pdb '
+                      f'(Rg={rg0:.2f} nm, maxDist={dmax0:.2f} nm)')
+                state['build'] = True
+        if not state.get('build'):
+            sh([sys.executable, '-u', os.path.join(HERE, 'build_start.py'),
+                '--seed', str(seed), '--out', start_pdb,
+                '--box-nm', str(args.box_nm), '--platform', args.build_platform],
+               rep, args.dry_run, log)
+            state['build'] = True
+        save_state()
 
     # ---- stage: pdb2gmx ---------------------------------------------------
     water, waters = find_ff(args.ff_dir)
@@ -246,17 +292,74 @@ def main():
                  f'pass --water explicitly')
     print(f'[setup] force field: {args.ff_dir}; water: {water} '
           f'(choices in port: {waters})')
+    # Make the custom FF visible to every gmx call from here on (pdb2gmx,
+    # ions grompp): topol.top includes the FF by relative name, resolved via
+    # cwd/GMXLIB/GMXDATA -- and cwd is the replica dir, so GMXLIB is required.
+    ff_parent = os.path.dirname(os.path.abspath(args.ff_dir))
+    os.environ['GMXLIB'] = (ff_parent + os.pathsep
+                            + os.environ.get('GMXLIB', ''))
     if state.get('pdb2gmx') and os.path.isfile(os.path.join(rep, 'conf.gro')):
         print('[setup] pdb2gmx: done, skipping')
     else:
-        ff_parent = os.path.dirname(os.path.abspath(args.ff_dir))
         ff_name = os.path.basename(os.path.abspath(args.ff_dir)).split('.')[0]
         env = os.environ.copy()
-        env['GMXLIB'] = ff_parent + os.pathsep + env.get('GMXLIB', '')
-        sh([gmx, 'pdb2gmx', '-f', 'start.pdb', '-o', 'conf.gro',
-            '-p', 'topol.top', '-ff', ff_name, '-water', water, '-ignh'],
-           rep, args.dry_run, log, env=env)
+        base = [gmx, 'pdb2gmx', '-f', 'start.pdb', '-o', 'conf.gro',
+                '-p', 'topol.top', '-ff', ff_name, '-ignh']
+        # GROMACS >= 2026 validates -water against the *stock* water list
+        # only: the custom port's watermodels.dat never reaches the
+        # command-line enum even with GMXLIB set (-ff IS accepted, -water is
+        # NOT). Try, in order:
+        #   1. -water <keyword>          (works where the enum includes GMXLIB)
+        #   2. interactive stdin selection (menu lists the FF's own models)
+        #   3. -water tip4p, then patch the topol.top include to the port's itp
+        water_idx = waters.index(water) + 1 if water in waters else 1
+        water_itp = water + '.itp'
+        attempts = [([*base, '-water', water], None),
+                    (base, f'{water_idx}\n')]
+        if os.path.isfile(os.path.join(args.ff_dir, water_itp)):
+            attempts.append(([*base, '-water', 'tip4p'], 'PATCH'))
+        ok = False
+        for cmd, mode in attempts:
+            note = ('' if mode is None else
+                    '   [stdin: water choice]' if mode != 'PATCH'
+                    else '   [+ patch topol.top water include]')
+            log.write('$ ' + ' '.join(cmd) + note + '\n'); log.flush()
+            print('$ ' + ' '.join(cmd) + note)
+            if args.dry_run:
+                ok = True
+                break
+            r = subprocess.run(cmd, cwd=rep, env=env,
+                               input=(mode if mode not in (None, 'PATCH')
+                                      else None),
+                               text=True, stdout=log,
+                               stderr=subprocess.STDOUT)
+            if r.returncode != 0:
+                log.write(f'[setup] pdb2gmx attempt failed (rc='
+                          f'{r.returncode}); trying next strategy\n')
+                log.flush()
+                continue
+            if mode == 'PATCH':
+                tp = os.path.join(rep, 'topol.top')
+                txt = open(tp).read()
+                # unanchored on purpose: pdb2gmx may write the include with
+                # a relative or an absolute ff path depending on how the FF
+                # was found; tip4p.itp appears only on the water line
+                new = txt.replace('tip4p.itp', water_itp)
+                if new != txt:
+                    open(tp, 'w').write(new)
+                    log.write(f'[setup] patched water include -> '
+                              f'{water_itp}\n')
+                else:
+                    log.write('[setup] WARNING: tip4p include not found in '
+                              'topol.top; check the water topology\n')
+                log.flush()
+            ok = True
+            break
+        if not ok:
+            sys.exit(f'[setup] pdb2gmx failed with all water-selection '
+                     f'strategies; see {log.name}')
         state['pdb2gmx'] = True
+        save_state()
 
     # ---- stage: box --------------------------------------------------------
     if state.get('box') and os.path.isfile(os.path.join(rep, 'boxed.gro')):
@@ -265,13 +368,15 @@ def main():
         sh([gmx, 'editconf', '-f', 'conf.gro', '-o', 'boxed.gro',
             '-bt', 'cubic', '-box', f'{args.box_nm:.1f}'], rep, args.dry_run, log)
         state['box'] = True
+        save_state()
 
     # ---- stage: solvate ----------------------------------------------------
-    # 4-point water geometry: prefer the .gro shipped in the FF port, else
-    # the stock GROMACS tip4p.gro (identical geometry to TIP4P-Disp).
+    # 4-point water geometry: prefer the .gro shipped in the FF port
+    # (e.g. a99SBdisp_water.gro in the Robustelli port), else the stock
+    # GROMACS tip4p.gro (identical geometry to TIP4P-Disp).
     tip4p_gro = None
     for cand in os.listdir(args.ff_dir):
-        if re.match(r'tip4p.*\.gro$', cand, re.I):
+        if re.search(r'(tip4p|disp).*\.gro$', cand, re.I):
             tip4p_gro = os.path.join(args.ff_dir, cand); break
     if tip4p_gro is None:
         gmxdata = os.environ.get('GMXDATA') or '/usr/local/gromacs/share/gromacs'
@@ -283,6 +388,7 @@ def main():
         sh([gmx, 'solvate', '-cp', 'boxed.gro', '-cs', tip4p_gro,
             '-o', 'solv.gro', '-p', 'topol.top'], rep, args.dry_run, log)
         state['solvate'] = True
+        save_state()
 
     # ---- stage: ions --------------------------------------------------------
     if state.get('ions') and os.path.isfile(os.path.join(rep, 'ions.gro')):
@@ -301,13 +407,14 @@ def main():
             if r.returncode != 0:
                 sys.exit(f'[setup] genion failed; see {log.name}')
         state['ions'] = True
+        save_state()
 
     state.update({'replica': args.replica, 'seed': seed,
                   'box_nm': args.box_nm, 'salt_M': args.salt_M,
                   'prod_us': args.us, 'prod_steps': total_steps,
-                  'frame_ps': args.frame_ps, 'water': water})
-    with open(state_path, 'w') as f:
-        json.dump(state, f, indent=2)
+                  'frame_ps': args.frame_ps, 'water': water,
+                  'ff_parent': ff_parent})
+    save_state()
     print(f'[setup] replica {args.replica} ready in {rep} '
           f'({args.us} us = {total_steps} steps). Next: run_asyn_aa.py')
 

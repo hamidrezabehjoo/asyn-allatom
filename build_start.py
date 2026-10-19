@@ -120,17 +120,17 @@ def ca_geometry(pdb_path):
 
 
 def collapse(pdb_in, pdb_out, seed, chunk_ps, gb_model, platform_name):
-    """Run one implicit-solvent collapse chunk; returns None."""
+    """Run one implicit-solvent collapse chunk; returns None.
+
+    Platform handling is fail-soft: 'auto' tries CUDA -> OpenCL -> CPU, but a
+    platform is only accepted after a real Context has been built AND a chunk
+    step has run -- a registered-but-broken plugin (e.g. conda-forge OpenMM
+    whose CUDA kernels are newer than the node driver ->
+    CUDA_ERROR_UNSUPPORTED_PTX_VERSION) falls through to the next candidate
+    instead of killing the setup."""
     from openmm import app, unit, LangevinMiddleIntegrator, Platform
-    if platform_name == 'auto':
-        platform_name = 'CPU'
-        for cand in ('CUDA', 'OpenCL'):
-            try:
-                Platform.getPlatformByName(cand)
-                platform_name = cand
-                break
-            except Exception:
-                continue
+    candidates = (['CUDA', 'OpenCL', 'CPU'] if platform_name == 'auto'
+                  else [platform_name])
     pdb = app.PDBFile(pdb_in)
     ff = app.ForceField('amber14-all.xml', f'implicit/{gb_model}.xml')
     mod = app.Modeller(pdb.topology, pdb.positions)
@@ -139,18 +139,36 @@ def collapse(pdb_in, pdb_out, seed, chunk_ps, gb_model, platform_name):
         collapse._hydrated = True
     system = ff.createSystem(mod.topology, nonbondedMethod=app.NoCutoff,
                              constraints=app.HBonds)
-    integ = LangevinMiddleIntegrator(300 * unit.kelvin, 1.0 / unit.picosecond,
-                                     2.0 * unit.femtoseconds)
-    integ.setRandomNumberSeed(seed)
-    sim = app.Simulation(mod.topology, system, integ,
-                         Platform.getPlatformByName(platform_name))
-    sim.context.setPositions(mod.positions)
-    sim.context.setVelocitiesToTemperature(300 * unit.kelvin, seed)
-    sim.minimizeEnergy(maxIterations=500)
-    sim.step(int(chunk_ps * 1000 / 2.0))
-    st = sim.context.getState(getPositions=True)
-    with open(pdb_out, 'w') as f:
-        app.PDBFile.writeFile(mod.topology, st.getPositions(), f)
+    errs = []
+    for cand in candidates:
+        try:
+            platform = Platform.getPlatformByName(cand)
+        except Exception as e:
+            errs.append(f'{cand}: not registered ({e})')
+            continue
+        try:
+            integ = LangevinMiddleIntegrator(300 * unit.kelvin,
+                                             1.0 / unit.picosecond,
+                                             2.0 * unit.femtoseconds)
+            integ.setRandomNumberSeed(seed)
+            sim = app.Simulation(mod.topology, system, integ, platform)
+            sim.context.setPositions(mod.positions)
+            sim.context.setVelocitiesToTemperature(300 * unit.kelvin, seed)
+            sim.minimizeEnergy(maxIterations=500)
+            sim.step(int(chunk_ps * 1000 / 2.0))
+        except Exception as e:
+            errs.append(f'{cand}: {type(e).__name__} '
+                        f'{str(e).strip().splitlines()[-1] if str(e).strip() else e}')
+            print(f'[build_start] platform {cand} unusable '
+                  f'({errs[-1]}); trying next')
+            continue
+        st = sim.context.getState(getPositions=True)
+        with open(pdb_out, 'w') as f:
+            app.PDBFile.writeFile(mod.topology, st.getPositions(), f)
+        if cand != candidates[0] or len(candidates) > 1:
+            print(f'[build_start] collapse running on platform: {cand}')
+        return
+    sys.exit('[build_start] no usable OpenMM platform: ' + ' | '.join(errs))
 
 
 def main():

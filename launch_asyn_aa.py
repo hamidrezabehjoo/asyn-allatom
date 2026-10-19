@@ -69,7 +69,7 @@ def main():
         if need:
             log(f'setup replica {r}')
             rc = subprocess.call(
-                [sys.executable, os.path.join(HERE, 'setup_asyn_aa.py'),
+                [sys.executable, '-u', os.path.join(HERE, 'setup_asyn_aa.py'),
                  '--replica', str(r), '--us', str(args.us),
                  '--frame-ps', str(args.frame_ps), '--salt-M', str(args.salt_M),
                  '--ff-dir', args.ff_dir]
@@ -91,7 +91,7 @@ def main():
     def launch(gpu, item):
         env = os.environ.copy()
         env['CUDA_VISIBLE_DEVICES'] = gpu
-        cmd = [sys.executable, os.path.join(HERE, 'run_asyn_aa.py'),
+        cmd = [sys.executable, '-u', os.path.join(HERE, 'run_asyn_aa.py'),
                '--replica', str(item['replica']),
                '--maxh', str(args.maxh), '--ntomp', str(args.ntomp)]
         if args.dry_run:

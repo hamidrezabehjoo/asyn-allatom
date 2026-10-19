@@ -58,6 +58,17 @@ def main():
         sys.exit(f'[run] setup incomplete for replica {args.replica} '
                  f'(ions stage not done) -- re-run setup_asyn_aa.py')
 
+    # topol.top includes the custom FF by relative name; make it resolvable
+    # for every grompp below (older state.json may lack ff_parent -> setup
+    # must be re-run once to record it)
+    ff_parent = state.get('ff_parent')
+    if ff_parent:
+        os.environ['GMXLIB'] = (ff_parent + os.pathsep
+                                + os.environ.get('GMXLIB', ''))
+    else:
+        print('[run] WARNING: state.json has no ff_parent; if grompp cannot '
+              'find the force field, re-run setup_asyn_aa.py once', flush=True)
+
     if args.mpi_launcher:
         gmx = shutil.which('gmx_mpi') or shutil.which('gmx') or 'gmx_mpi'
     else:

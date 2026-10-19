@@ -25,6 +25,12 @@
 #
 # Everything is resumable: a walltime kill means resubmit the identical
 # command; finished stages are skipped, production resumes from prod.cpt.
+#
+# Walltime routing on ASPIRE 2A: walltime <= 24:00:00 lands in g1-g4
+# (24 h cap); walltime > 24:00:00 routes to glong with a 120 h (5 day)
+# cap, max ~2 running jobs per user. For the 5-day variant change the
+# header above to walltime=120:00:00 AND pass MAXH=119.5 via qsub -v.
+# Smoke tests: qsub -l walltime=02:00:00 routes to gdev (priority lane).
 # Edited on Windows? fix line breaks first:  sed -i 's/\r$//' submit_asyn_aa.pbs
 # ============================================================================
 set -euo pipefail
@@ -63,7 +69,11 @@ NTOMP="${NTOMP:-$(( NCPU / GPUS > 0 ? NCPU / GPUS : 1 ))}"
 echo "== asyn-aa job =="
 echo "  job     : ${PBS_JOBID:-interactive}"
 echo "  node    : $(hostname)   phase: $PHASE   gpus: $GPUS ($GPU_LIST)   ntomp/replica: $NTOMP"
-echo "  replicas: $REPLICAS   us/replica: $US   maxh: $MAXH   retries: $RETRIES"
+case "$PHASE" in
+    smoke) echo "  smoke   : replicas 1   us: ${SMOKE_US:-0.001}   maxh: 1" ;;
+    setup) echo "  setup   : replicas $REPLICAS   us/replica: $US (topology only, no MD)" ;;
+    run)   echo "  run     : replicas $REPLICAS   us/replica: $US   maxh: $MAXH   retries: $RETRIES" ;;
+esac
 nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader || true
 
 echo "== pre-flight =="
