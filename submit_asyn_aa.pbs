@@ -7,7 +7,7 @@
 #PBS -j oe
 # ============================================================================
 # alpha-synuclein all-atom MD campaign (a99SB-disp / TIP4P-Disp, 16 nm box,
-# 300 K / 1 atm / 150 mM NaCl) -- NSCC ASPIRE 2A. Tuned from submit_panel3.sh.
+# 300 K / 1 atm / 150 mM NaCl) -- NSCC ASPIRE 2B. Tuned from submit_panel3.sh.
 #
 # Submit from the repo dir (or override REPO):
 #   qsub -v PHASE=smoke,REPO="$PWD" submit_asyn_aa.pbs   # 1 replica x 1 ns; run FIRST
@@ -23,10 +23,20 @@
 # NEVER let two jobs share a replica number: same run dir, same prod.cpt,
 # two mdruns appending at once = corrupted checkpoint.
 #
+# CAMPAIGN LAYOUT (ASPIRE 2B, glong lane: max 2 running jobs/user,
+# <=128 GPUs/job, 120 h). Multi-node via pbsdsh: one launcher per node,
+# contiguous replica block per node. 2 jobs x 2 nodes x 2 GPUs = 8 GPUs:
+#   qsub -l select=2:ncpus=48:ngpus=2 -l walltime=120:00:00 \
+#        -v "PHASE=run,REPLICAS=1-4,US=2.5,MAXH=119,REPO=$PWD" submit_asyn_aa.pbs
+#   qsub -l select=2:ncpus=48:ngpus=2 -l walltime=120:00:00 \
+#        -v "PHASE=run,REPLICAS=5-8,US=2.5,MAXH=119,REPO=$PWD" submit_asyn_aa.pbs
+# When a job hits the 120 h wall, resubmit the IDENTICAL command; every
+# replica resumes from prod.cpt. Repeat until all prod.done exist.
+#
 # Everything is resumable: a walltime kill means resubmit the identical
 # command; finished stages are skipped, production resumes from prod.cpt.
 #
-# Walltime routing on ASPIRE 2A: walltime <= 24:00:00 lands in g1-g4
+# Walltime routing on ASPIRE 2B: walltime <= 24:00:00 lands in g1-g4
 # (24 h cap); walltime > 24:00:00 routes to glong with a 120 h (5 day)
 # cap, max ~2 running jobs per user. For the 5-day variant change the
 # header above to walltime=120:00:00 AND pass MAXH=119.5 via qsub -v.
@@ -54,7 +64,8 @@ RETRIES="${RETRIES:-2}"
 # caches on scratch (batch jobs do not read ~/.bashrc)
 export PIP_CACHE_DIR="$SCRATCH/pipcache" TMPDIR="$SCRATCH/tmp" XDG_CACHE_HOME="$SCRATCH/cache"
 
-source "$(conda info --base)/etc/profile.d/conda.sh"
+CONDA_BASE="$(conda info --base)"
+source "$CONDA_BASE/etc/profile.d/conda.sh"
 conda activate "$ENV_PREFIX"
 module load "$GMX_MODULE" 2>/dev/null \
     || echo "WARN: 'module load $GMX_MODULE' failed -- relying on PATH"
@@ -63,8 +74,10 @@ cd "$REPO"
 # knobs follow the actual allocation
 GPUS="$(nvidia-smi -L 2>/dev/null | grep -c '^GPU' || echo 1)"
 GPU_LIST="$(seq -s, 0 $((GPUS - 1)))"
-NCPU="${NCPUS:-16}"                        # PBS Pro exports NCPUS
-NTOMP="${NTOMP:-$(( NCPU / GPUS > 0 ? NCPU / GPUS : 1 ))}"
+NCPU="${NCPUS:-16}"                        # PBS Pro exports NCPUS (total over nodes)
+NODES=1
+[ -n "${PBS_NODEFILE:-}" ] && NODES=$(sort -u "$PBS_NODEFILE" | wc -l)
+NTOMP="${NTOMP:-$(( (NCPU / NODES / GPUS) > 0 ? (NCPU / NODES / GPUS) : 1 ))}"
 
 echo "== asyn-aa job =="
 echo "  job     : ${PBS_JOBID:-interactive}"
@@ -81,6 +94,10 @@ command -v gmx >/dev/null 2>&1 || {
     echo "FATAL: gmx not found on PATH -- set GMX_MODULE=<cluster GPU module>" >&2
     exit 1; }
 which gmx
+# resolve the install bin NOW (head node has gmx); pbsdsh tasks get a
+# scrubbed PATH, so they fall back to this instead of the module system
+GMX_BIN="$(cd "$(dirname "$(command -v gmx)")" && pwd)"
+echo "  gmx bin : $GMX_BIN"
 gmx --version | grep -iE 'gromacs version|cuda|gpu support' || true
 [ -d "$FF_DIR" ] || {
     echo "FATAL: a99SBdisp.ff not found at $FF_DIR" >&2
@@ -93,15 +110,55 @@ gmx --version | head -3
 python3 -c "import sys, openmm; print('python', sys.version.split()[0], '| openmm', openmm.__version__)"
 git log --oneline -1 2>/dev/null || echo "(repo not under git)"
 
-case "$PHASE" in
-    smoke)  python3 launch_asyn_aa.py --replicas 1 --gpus "${GPU_LIST%%,*}" \
-                --us "${SMOKE_US:-0.001}" --maxh 1 --ntomp "$NTOMP" --ff-dir "$FF_DIR" ;;
-    setup)  python3 launch_asyn_aa.py --replicas "$REPLICAS" --gpus "$GPU_LIST" \
-                --us "$US" --setup-only --ff-dir "$FF_DIR" ;;
-    run)    python3 launch_asyn_aa.py --replicas "$REPLICAS" --gpus "$GPU_LIST" \
-                --us "$US" --maxh "$MAXH" --ntomp "$NTOMP" \
-                --retries "$RETRIES" --ff-dir "$FF_DIR" ;;
-esac
+if [ "$NODES" -gt 1 ] && [ "$PHASE" != "smoke" ]; then
+    # --- multi-node: one launcher per node via pbsdsh (TM interface, no ssh).
+    # Task body lives in pbsdsh_task.sh (a real file: no nested quoting
+    # through TM) and logs per node to pbsdsh_node<N>.log (stdout relay of
+    # pbsdsh is lossy on some sites -- never rely on it).
+    echo "  multi-node: $NODES nodes, one launcher per node (pbsdsh)"
+    echo "  per-node logs: $REPO/pbsdsh_node<N>.log"
+    # TM tasks inherit only the qsub -v environment, NOT variables exported
+    # at runtime -> hand everything over via a file the task sources.
+    {
+        printf "CONDA_BASE='%s'\n" "$CONDA_BASE"
+        printf "ENV_PREFIX='%s'\n" "$ENV_PREFIX"
+        printf "GMX_MODULE='%s'\n" "$GMX_MODULE"
+        printf "GMX_BIN='%s'\n" "$GMX_BIN"
+        # replay the head node's full working paths inside the task: TM
+        # scrubs LD_LIBRARY_PATH, and gmx exits 127 (loader cannot find
+        # its shared libraries) on task nodes without it
+        printf "PATH_SAVE='%s'\n" "$PATH"
+        printf "LD_LIBRARY_PATH_SAVE='%s'\n" "${LD_LIBRARY_PATH:-}"
+        printf "FF_DIR='%s'\n" "$FF_DIR"
+        printf "NODES='%s'\n" "$NODES"
+        printf "NTOMP='%s'\n" "$NTOMP"
+        printf "RETRIES='%s'\n" "$RETRIES"
+        printf "US='%s'\n" "$US"
+        printf "MAXH='%s'\n" "$MAXH"
+        printf "PHASE='%s'\n" "$PHASE"
+        printf "REPLICAS='%s'\n" "$REPLICAS"
+        printf "REPO='%s'\n" "$REPO"
+    } > "$REPO/.pbsdsh_task_env"
+    rm -f "$REPO"/.task_*.ok
+    pbsdsh /bin/bash "$REPO/pbsdsh_task.sh"
+    # this pbsdsh exits 0 even when tasks fail -> verify via sentinels
+    n_ok=$(ls "$REPO"/.task_*.ok 2>/dev/null | wc -l)
+    if [ "$n_ok" -ne "$NODES" ]; then
+        echo "FATAL: only $n_ok/$NODES node tasks completed --" >&2
+        echo "       see $REPO/pbsdsh_node<N>.log" >&2
+        exit 1
+    fi
+else
+    case "$PHASE" in
+        smoke)  python3 launch_asyn_aa.py --replicas 1 --gpus "${GPU_LIST%%,*}" \
+                    --us "${SMOKE_US:-0.001}" --maxh 1 --ntomp "$NTOMP" --ff-dir "$FF_DIR" ;;
+        setup)  python3 launch_asyn_aa.py --replicas "$REPLICAS" --gpus "$GPU_LIST" \
+                    --us "$US" --setup-only --ff-dir "$FF_DIR" ;;
+        run)    python3 launch_asyn_aa.py --replicas "$REPLICAS" --gpus "$GPU_LIST" \
+                    --us "$US" --maxh "$MAXH" --ntomp "$NTOMP" \
+                    --retries "$RETRIES" --ff-dir "$FF_DIR" ;;
+    esac
+fi
 
 echo "== done: $PHASE =="
 echo "REMINDER: scratch purges at 30 days -- copy runs/repNN/ back now."

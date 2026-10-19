@@ -49,11 +49,25 @@ def main():
     ap.add_argument('--poll-s', type=int, default=60)
     ap.add_argument('--setup-only', action='store_true',
                     help='only build systems, do not run production')
+    ap.add_argument('--node-index', type=int, default=0,
+                    help='index of this node within a multi-node job '
+                         '(the pbs script passes PBS_NODENUM via pbsdsh)')
+    ap.add_argument('--node-count', type=int, default=1,
+                    help='number of nodes in the job; the replica list is '
+                         'split into contiguous blocks, one per node')
     ap.add_argument('--dry-run', action='store_true')
     args = ap.parse_args()
 
     replicas = parse_replicas(args.replicas)
     gpus = [g.strip() for g in args.gpus.split(',')]
+    if args.node_count > 1:
+        if not 0 <= args.node_index < args.node_count:
+            sys.exit(f'[launch] --node-index {args.node_index} out of range '
+                     f'for --node-count {args.node_count}')
+        base, rem = divmod(len(replicas), args.node_count)
+        lo = args.node_index * base + min(args.node_index, rem)
+        hi = lo + base + (1 if args.node_index < rem else 0)
+        replicas = replicas[lo:hi]
     logf = open(os.path.join(HERE, 'launcher.log'), 'a', buffering=1)
 
     # Truncated copies (e.g. an interrupted scp leaving a 0-byte script)
@@ -67,6 +81,12 @@ def main():
 
     def log(msg):
         logline(msg); logf.write(f'[{datetime.datetime.now():%H:%M:%S}] {msg}\n')
+
+    if args.node_count > 1:
+        log(f'node {args.node_index}/{args.node_count}: replicas {replicas}')
+    if not replicas:
+        log('nothing to do on this node')
+        return
 
     # ---- setup phase (sequential; fast, CPU-bound) -------------------------
     for r in replicas:

@@ -63,7 +63,7 @@ DispCorr                = no
 pbc                     = xyz
 tcoupl                  = v-rescale
 tc-grps                 = Protein Water_and_ions
-tau-t                   = 1.0
+tau-t                   = 1.0 1.0          ; one value PER tc-grp (grompp errors on count mismatch)
 ref-t                   = {T} {T}
 comm-mode               = Linear
 comm-grps               = Protein Water_and_ions
@@ -223,6 +223,10 @@ def main():
                     choices=['auto', 'CUDA', 'OpenCL', 'CPU'],
                     help='OpenMM platform for the start-structure collapse '
                          '(GPU node recommended; auto detects)')
+    ap.add_argument('--max-collapse-ns', type=float, default=8.0,
+                    help='implicit-solvent collapse budget per replica; some '
+                         'seeds collapse to a dumbbell whose tail needs '
+                         '>2 ns to fit the box (default 8.0)')
     ap.add_argument('--dry-run', action='store_true')
     args = ap.parse_args()
 
@@ -267,21 +271,24 @@ def main():
         if not os.path.isfile(start_pdb):
             state['build'] = False  # checkpoint lied; structure is gone
         if os.path.isfile(start_pdb):
-            # adopt a leftover start structure if it already fits the box
-            # (e.g. collapse finished but a later stage failed before the
-            # checkpoint was written)
+            # adopt a leftover start structure if it is COMPLETE and fits
+            # the box. The residue-count check matters: a NaN crash during
+            # PDBFile.writeFile can leave a truncated start.pdb whose
+            # partial chain trivially "fits" -- adopting it would build a
+            # silently shortened protein.
             try:
-                rg0, dmax0, _ = _ca_span_nm(start_pdb)
+                rg0, dmax0, n0 = _ca_span_nm(start_pdb)
             except Exception:
-                rg0, dmax0 = 0.0, None
-            if dmax0 is not None and dmax0 < args.box_nm - 2.0:
+                rg0, dmax0, n0 = 0.0, None, 0
+            if n0 == 140 and dmax0 is not None and dmax0 < args.box_nm - 2.0:
                 print(f'[setup] adopting existing start.pdb '
                       f'(Rg={rg0:.2f} nm, maxDist={dmax0:.2f} nm)')
                 state['build'] = True
         if not state.get('build'):
             sh([sys.executable, '-u', os.path.join(HERE, 'build_start.py'),
                 '--seed', str(seed), '--out', start_pdb,
-                '--box-nm', str(args.box_nm), '--platform', args.build_platform],
+                '--box-nm', str(args.box_nm), '--platform', args.build_platform,
+                '--max-collapse-ns', str(args.max_collapse_ns)],
                rep, args.dry_run, log)
             state['build'] = True
         save_state()
