@@ -14,11 +14,18 @@ Strategy (standard for long IDPs):
      Replica diversity comes from the seeded collapse dynamics (velocities
      + Langevin noise), not from the starting torsions.
   2. Add the C-terminal OXT oxygen (needed for C-terminal templates).
-  3. Collapse in implicit solvent (OpenMM, amber14-all + GBn2 by
+  3. Collapse in implicit solvent (OpenMM, amber14-all + GB-OBC2 by
      default) in chunks until the chain fits the target box
      (max CA-CA distance < fit_nm) -- a fully extended 140-mer spans
      ~30-50 nm and would crash through its own periodic image in the
      DESRES 160 A (16 nm) box.
+     NOTE on the GB model: GBn2 (= AMBER igb=8) is the least numerically
+     stable GB variant and detonated on ALL platforms (CPU included) for
+     extended, highly charged starts (~24 formal charges on a 42 nm
+     string) even after 5000 minimization steps + a 1 fs/100 K warm-up
+     (seeds 1004/1005/1007, 2026-10-19). GB-OBC2 (igb=5) is the stable
+     workhorse; the collapse model only manufactures a starting
+     structure -- the explicit-solvent a99SB-disp physics is untouched.
 
 The collapsed conformer is only a *starting structure*: explicit-solvent
 equilibration and the first ns of production erase memory of the
@@ -121,20 +128,25 @@ def _pdb_min_separation(pdb_path, seq_sep=3):
     return dmin
 
 
-def _coil_energy_ok(coil_pdb, gb_model, max_kj=1e8):
-    """Direct 'will dynamics explode?' screen: build the EXACT collapse
-    Hamiltonian (amber14 + GB, hydrogens added) on the coil and evaluate the
-    potential energy on the CPU platform (always registered, always honest).
-    Reject non-finite or astronomically positive energies -- an exact atomic
-    coincidence gives inf here while looking innocuous to purely geometric
-    checks. Returns (ok, energy_kj_per_mol)."""
+def _chain_dynamics_ok(chain_pdb, gb_model, fmax_tol=1e5, max_kj=1e8):
+    """Direct 'will dynamics explode?' screen, v3. Build the EXACT collapse
+    Hamiltonian (amber14 + GB, hydrogens added) on the CPU platform (always
+    registered, always honest), minimize 1000 steps, then inspect FORCES --
+    the quantity that actually detonates dynamics. v1 checked geometry,
+    v2 checked energy; both passed the seed-1004 extended chain
+    (+7.4e4 kJ/mol = ~30,000 kT of hidden strain) which then NaN'd every
+    platform even after a 5000-step minimize + 100 K/1 fs warm-up: a local
+    force singularity the minimizer cannot resolve explodes the first MD
+    steps regardless of temperature or timestep. Post-minimization max |F|
+    is the honest instrument, and on rejection the offending atom pair is
+    printed -- failure becomes diagnosis. Returns (ok, energy_kj_per_mol)."""
     try:
         from openmm import app, unit, Platform, LangevinMiddleIntegrator
     except ImportError:
         print('[build_start] WARNING: openmm not importable; skipping '
-              'coil energy screen')
+              'chain dynamics screen')
         return True, float('nan')
-    pdb = app.PDBFile(coil_pdb)
+    pdb = app.PDBFile(chain_pdb)
     ff = app.ForceField('amber14-all.xml', f'implicit/{gb_model}.xml')
     mod = app.Modeller(pdb.topology, pdb.positions)
     mod.addHydrogens(ff, pH=7.0)
@@ -146,11 +158,39 @@ def _coil_energy_ok(coil_pdb, gb_model, max_kj=1e8):
                          Platform.getPlatformByName('CPU'))
     sim.context.setPositions(mod.positions)
     try:
-        pe = sim.context.getState(getEnergy=True).getPotentialEnergy()
-        pe = pe.value_in_unit(unit.kilojoule_per_mole)
+        e0 = sim.context.getState(getEnergy=True).getPotentialEnergy()
+        e0 = e0.value_in_unit(unit.kilojoule_per_mole)
+        if not np.isfinite(e0) or e0 >= max_kj:
+            return False, e0
+        sim.minimizeEnergy(maxIterations=1000)
+        st1 = sim.context.getState(getEnergy=True, getForces=True,
+                                   getPositions=True)
+        e1 = st1.getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole)
+        f1 = st1.getForces(asNumpy=True).value_in_unit(
+            unit.kilojoule_per_mole / unit.nanometer)
+        enorm = np.linalg.norm(f1, axis=1)
+        fmax = float(enorm.max())
+        if not np.isfinite(e1) or not np.isfinite(fmax):
+            return False, e1
+        if fmax >= fmax_tol:
+            # report the offender and its nearest nonbonded neighbour
+            ats = list(mod.topology.atoms())
+            i = int(enorm.argmax())
+            a = ats[i]
+            pos = st1.getPositions(asNumpy=True).value_in_unit(unit.nanometer)
+            rid = np.array([int(x.residue.id) for x in ats])
+            d = np.linalg.norm(pos - pos[i], axis=1)
+            d[(np.abs(rid - rid[i]) <= 1)] = np.inf   # skip bonded neighbours
+            j = int(d.argmin())
+            b = ats[j]
+            print(f'[build_start] force pathology: max |F| = {fmax:.3g} '
+                  f'kJ/mol/nm at {a.name} {a.residue.name} {a.residue.id}; '
+                  f'nearest nonbonded: {b.name} {b.residue.name} '
+                  f'{b.residue.id} at {d[j] * 10:.2f} A')
+            return False, e1
+        return True, e1
     except Exception:
         return False, float('nan')
-    return bool(np.isfinite(pe) and pe < max_kj), pe
 
 
 def _pdb_text(structure):
@@ -219,15 +259,16 @@ def collapse(pdb_in, pdb_out, seed, chunk_ps, gb_model, platform_name):
     CUDA_ERROR_UNSUPPORTED_PTX_VERSION) falls through to the next candidate
     instead of killing the setup.
 
-    NaN handling: a random coil can hold atom clashes that a 500-step
-    minimization does not relax; the first MD steps then explode and
-    positions go NaN (observed on OpenCL, seed 1004). Each platform gets up
-    to 3 attempts; attempts 2-3 run a hard minimize (5000 steps) plus a
-    cold 10 ps / 1 fs warm-up before the real chunk, with re-seeded
-    velocities. The chunk is verified finite BEFORE writing, and the PDB
-    is written atomically (tmp + rename) so a crash mid-write can never
-    leave a truncated start structure that a later adopt-check might
-    mistake for a collapsed one."""
+    NaN handling: every chunk is pre-conditioned -- a hard 5000-step
+    minimization followed by a two-stage cold warm-up (10 ps at 100 K,
+    then 5 ps at 200 K, both at 1 fs) before the real 300 K / 2 fs chunk.
+    Dropping an extended, multiply-charged chain straight into 300 K
+    dynamics is a Coulomb shock that can NaN even a well-posed GB model;
+    the ramp costs seconds and makes the collapse boring. Each platform
+    gets up to 3 attempts with re-seeded velocities. The chunk is verified
+    finite BEFORE writing, and the PDB is written atomically (tmp +
+    rename) so a crash mid-write can never leave a truncated start
+    structure that a later adopt-check might mistake for a collapsed one."""
     from openmm import app, unit, LangevinMiddleIntegrator, Platform
     candidates = (['CUDA', 'OpenCL', 'CPU'] if platform_name == 'auto'
                   else [platform_name])
@@ -250,26 +291,39 @@ def collapse(pdb_in, pdb_out, seed, chunk_ps, gb_model, platform_name):
             seed_a = seed + 7919 * attempt
             start_pos = mod.positions
             try:
-                if attempt:
-                    # escalation: hard minimize + cold, careful warm-up
-                    integ0 = LangevinMiddleIntegrator(100 * unit.kelvin,
-                                                      1.0 / unit.picosecond,
-                                                      1.0 * unit.femtoseconds)
-                    integ0.setRandomNumberSeed(seed_a)
+                # unconditional pre-conditioning: hard minimize, then a
+                # two-stage cold ramp (100 K -> 200 K, 1 fs) before the
+                # real 300 K / 2 fs chunk
+                integ0 = LangevinMiddleIntegrator(100 * unit.kelvin,
+                                                  1.0 / unit.picosecond,
+                                                  1.0 * unit.femtoseconds)
+                integ0.setRandomNumberSeed(seed_a)
+                try:
                     sim0 = app.Simulation(mod.topology, system, integ0,
                                           platform)
-                    sim0.context.setPositions(mod.positions)
-                    sim0.context.setVelocitiesToTemperature(100 * unit.kelvin,
-                                                            seed_a)
-                    sim0.minimizeEnergy(maxIterations=5000)
-                    sim0.step(10000)  # 10 ps at 1 fs / 100 K
-                    st0 = sim0.context.getState(getPositions=True)
-                    pos0 = st0.getPositions(asNumpy=True)
-                    if not np.isfinite(
-                            pos0.value_in_unit(unit.nanometer)).all():
-                        raise ValueError('NaN/inf positions after warm-up')
-                    start_pos = pos0
-                    del sim0, integ0
+                except Exception as e:
+                    # registered-but-broken platform (e.g. CUDA PTX mismatch):
+                    # retrying is pointless -- move to the next candidate
+                    errs.append(f'{cand}: init failed ({type(e).__name__})')
+                    print(f'[build_start] platform {cand} unusable '
+                          f'({errs[-1]}); trying next')
+                    break
+                sim0.context.setPositions(mod.positions)
+                sim0.context.setVelocitiesToTemperature(100 * unit.kelvin,
+                                                        seed_a)
+                sim0.minimizeEnergy(maxIterations=5000)
+                sim0.step(10000)  # 10 ps at 1 fs / 100 K
+                integ0.setTemperature(200 * unit.kelvin)
+                sim0.context.setVelocitiesToTemperature(200 * unit.kelvin,
+                                                        seed_a + 1)
+                sim0.step(5000)   # 5 ps at 1 fs / 200 K
+                st0 = sim0.context.getState(getPositions=True)
+                pos0 = st0.getPositions(asNumpy=True)
+                if not np.isfinite(
+                        pos0.value_in_unit(unit.nanometer)).all():
+                    raise ValueError('NaN/inf positions after warm-up')
+                start_pos = pos0
+                del sim0, integ0
                 integ = LangevinMiddleIntegrator(300 * unit.kelvin,
                                                  1.0 / unit.picosecond,
                                                  2.0 * unit.femtoseconds)
@@ -289,8 +343,6 @@ def collapse(pdb_in, pdb_out, seed, chunk_ps, gb_model, platform_name):
                 sim.context.setPositions(start_pos)
                 sim.context.setVelocitiesToTemperature(300 * unit.kelvin,
                                                        seed_a)
-                if not attempt:
-                    sim.minimizeEnergy(maxIterations=500)
                 sim.step(int(chunk_ps * 1000 / 2.0))
                 st = sim.context.getState(getPositions=True, getEnergy=True)
                 pe = st.getPotentialEnergy().value_in_unit(
@@ -306,7 +358,7 @@ def collapse(pdb_in, pdb_out, seed, chunk_ps, gb_model, platform_name):
             except Exception as e:
                 errs.append(f'{cand}/try{attempt}: {type(e).__name__} '
                             f'{str(e).strip().splitlines()[-1] if str(e).strip() else e}')
-                nxt = ('retrying with hard minimize + cold warm-up'
+                nxt = ('retrying with re-seeded velocities'
                        if attempt < 2 else f'giving up on {cand}')
                 print(f'[build_start] collapse failed ({errs[-1]}); {nxt}')
                 continue
@@ -314,7 +366,7 @@ def collapse(pdb_in, pdb_out, seed, chunk_ps, gb_model, platform_name):
                 print(f'[build_start] collapse running on platform: {cand}')
             if attempt:
                 print(f'[build_start] chunk recovered on attempt '
-                      f'{attempt + 1} (hard minimize + cold warm-up)')
+                      f'{attempt + 1}')
             return
     sys.exit('[build_start] no usable OpenMM platform: ' + ' | '.join(errs))
 
@@ -333,9 +385,12 @@ def main():
                     help='implicit-solvent collapse chunk between geometry checks')
     ap.add_argument('--max-collapse-ns', type=float, default=2.0,
                     help='give up if not collapsed after this much implicit MD')
-    ap.add_argument('--gb-model', default='gbn2',
+    ap.add_argument('--gb-model', default='obc2',
                     choices=['gbn2', 'gbn', 'obc2', 'obc1', 'hct'],
-                    help='implicit model for the collapse (start only; gbn2 = GBNeck-family)')
+                    help='implicit model for the collapse (start only). '
+                         'Default obc2: GBn2 (= AMBER igb=8) detonated on '
+                         'extended charged starts on every platform; obc2 '
+                         '(igb=5) is the stable workhorse')
     ap.add_argument('--platform', default='auto',
                     choices=['auto', 'CUDA', 'OpenCL', 'CPU'],
                     help='OpenMM platform for the collapse (default auto: '
@@ -352,12 +407,14 @@ def main():
 
     fit_nm = args.box_nm - args.fit_margin_nm
     # Build a start chain that survives TWO screens before any dynamics:
-    #   1. geometric: no two atoms >=3 residues apart closer than 1.2 A
-    #   2. energetic: the actual collapse Hamiltonian evaluates finite and
-    #      non-explosive on the chain (catches what geometry misses)
-    # Extended starts are clash-free by construction, so the screens pass
-    # on the first draw; random coils may need resampling. Derived resample
-    # seeds (seed*1000+k) are deterministic and printed for provenance.
+    #   1. geometric: no two heavy atoms >=3 residues apart closer than 1.2 A
+    #   2. dynamical: minimize 1000 steps under the real collapse Hamiltonian
+    #      and demand gentle POST-MINIMIZATION FORCES (max |F| < 1e5
+    #      kJ/mol/nm) -- energy lies, forces do not. On rejection the
+    #      offending atom pair is printed.
+    # Extended starts are clash-free by construction, so the screens should
+    # pass on the first draw; random coils may need resampling. Derived
+    # resample seeds (seed*1000+k) are deterministic and printed.
     coil_path = args.out + '.coil.pdb'
     seed_used = args.seed
     for k in range(8):
@@ -376,13 +433,14 @@ def main():
             print(f'[build_start] {mode} clash: atoms >=3 residues apart only '
                   f'{dmin:.2f} A (seed {seed_used}); resampling')
             continue
-        eok, pe = _coil_energy_ok(coil_path, args.gb_model)
+        eok, pe = _chain_dynamics_ok(coil_path, args.gb_model)
         if not eok:
-            print(f'[build_start] {mode} energy pathological '
+            print(f'[build_start] {mode} dynamics screen failed '
                   f'(Epot={pe:.3g} kJ/mol, seed {seed_used}); resampling')
             continue
         print(f'[build_start] {mode} screens passed: minSep={dmin:.2f} A, '
-              f'Epot={pe:.3g} kJ/mol (seed {seed_used})')
+              f'post-min Epot={pe:.3g} kJ/mol, forces gentle '
+              f'(seed {seed_used})')
         break
     else:
         sys.exit('[build_start] could not build a clash-free start in 8 '
