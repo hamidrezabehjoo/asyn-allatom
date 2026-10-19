@@ -56,6 +56,15 @@ def main():
     gpus = [g.strip() for g in args.gpus.split(',')]
     logf = open(os.path.join(HERE, 'launcher.log'), 'a', buffering=1)
 
+    # Truncated copies (e.g. an interrupted scp leaving a 0-byte script)
+    # make Python exit 0 with no output -- indistinguishable from success
+    # downstream. Refuse to fly with empty/missing scripts.
+    for script in ('setup_asyn_aa.py', 'run_asyn_aa.py', 'build_start.py'):
+        p = os.path.join(HERE, script)
+        if not os.path.isfile(p) or os.path.getsize(p) == 0:
+            sys.exit(f'[launch] {p} is missing or EMPTY (truncated copy?) '
+                     f'-- re-copy it and verify with md5sum')
+
     def log(msg):
         logline(msg); logf.write(f'[{datetime.datetime.now():%H:%M:%S}] {msg}\n')
 
@@ -110,12 +119,21 @@ def main():
                 if rc is None:
                     continue
                 del running[gpu]
-                if rc == 0:
+                # rc==0 alone is not proof of completion (a truncated
+                # script exits 0 silently): require the prod.done sentinel.
+                sentinel = os.path.join(HERE, 'runs',
+                                        f'rep{item["replica"]:02d}',
+                                        'prod.done')
+                really_done = (rc == 0 and
+                               (args.dry_run or os.path.isfile(sentinel)))
+                if really_done:
                     done.append(item['replica'])
                     log(f'replica {item["replica"]} DONE '
                         f'({len(done)}/{len(replicas)})')
                 elif item['attempts'] <= args.retries:
-                    log(f'replica {item["replica"]} exited {rc} -- '
+                    why = ('exited 0 but prod.done MISSING -- suspicious'
+                           if rc == 0 else f'exited {rc}')
+                    log(f'replica {item["replica"]} {why} -- '
                         f'requeuing (resume from checkpoint)')
                     pending.append(item)
                 else:

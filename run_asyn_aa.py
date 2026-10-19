@@ -90,7 +90,12 @@ def main():
         print(line, flush=True); logf.write(line + '\n')
         if args.dry_run:
             return
-        r = subprocess.run(cmd, cwd=rep, stdout=logf, stderr=subprocess.STDOUT)
+        env = dict(os.environ)
+        # mdrun aborts if OMP_NUM_THREADS disagrees with -ntomp; the cluster
+        # environment may export an arbitrary value, so pin it here
+        env['OMP_NUM_THREADS'] = str(args.ntomp)
+        r = subprocess.run(cmd, cwd=rep, env=env,
+                           stdout=logf, stderr=subprocess.STDOUT)
         if r.returncode != 0:
             sys.exit(f'[run] FAILED ({r.returncode}): {" ".join(cmd)} '
                      f'-- see {logf.name}; re-run this script to resume')
