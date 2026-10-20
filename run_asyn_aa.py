@@ -177,13 +177,52 @@ def main():
     # after one ~maxh chunk (a fraction of the target) and the sentinel
     # then skips the replica forever (2026-10-20 review).
     def prod_step():
-        """Last step of the energy-table in prod.log (0 if none yet)."""
+        """Best estimate of completed production steps (0 if nothing
+        reports). Format drift killed the naive table regex (GROMACS
+        2026.2 dropped the Lambda column for non-FEP runs, dropped the
+        'will finish' heartbeat, and row trailing whitespace is not
+        guaranteed), so use THREE independent sources and take the max:
+        1. energy-table rows, anchored on the 'Step ... Time' header and
+           matched to end-of-line,
+        2. 'step N, will finish' heartbeat lines (older GROMACS),
+        3. the edr trailer via `gmx check` (time / dt).
+        """
+        last = 0
         logf_path = os.path.join(rep, 'prod.log')
-        if not os.path.isfile(logf_path):
-            return 0
-        hits = re.findall(r'^\s*(\d+)\s+\d+\.\d+\s',
-                          open(logf_path, errors='ignore').read(), re.M)
-        return int(hits[-1]) if hits else 0
+        if os.path.isfile(logf_path):
+            want_row = False
+            for line in open(logf_path, errors='ignore'):
+                if re.match(r'^\s*Step\s+Time\b', line):
+                    want_row = True
+                    continue
+                if want_row:
+                    m = re.match(r'^\s*(\d+)\s+\d+\.\d+(?:\s.*)?$', line)
+                    if m:
+                        last = int(m.group(1))
+                    want_row = False
+                m = re.match(r'^\s*step\s+(\d+),?\s+will finish', line, re.I)
+                if m:
+                    last = max(last, int(m.group(1)))
+        edr_path = os.path.join(rep, 'prod.edr')
+        if os.path.isfile(edr_path):
+            dt = 0.002
+            mdp_path = os.path.join(rep, 'mdp', 'prod.mdp')
+            if os.path.isfile(mdp_path):
+                m = re.search(r'^\s*dt\s*=\s*([\d.]+)',
+                              open(mdp_path, errors='ignore').read(), re.M)
+                if m:
+                    dt = float(m.group(1))
+            try:
+                r = subprocess.run([gmx, 'check', '-e', 'prod.edr'],
+                                   cwd=rep, capture_output=True, text=True,
+                                   timeout=120)
+                m = re.findall(r'Last frame\s+\S+\s+time\s+([\d.]+)',
+                               r.stdout + r.stderr)
+                if m:
+                    last = max(last, int(float(m[-1]) / dt))
+            except Exception:
+                pass  # edr may be mid-write; the log sources still hold
+        return last
 
     target = state['prod_steps']
     if stage_done('prod') and prod_step() >= target:

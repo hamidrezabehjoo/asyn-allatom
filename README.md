@@ -53,10 +53,13 @@ disordered protein by swapping the sequence and the start structures.
 
 ```bash
 git clone <this-repo> && cd asyn-allatom
+md5sum -c md5sums.txt                        # intact checkout: every line OK
 conda env create -f environment.yml          # python 3.11 + openmm + PeptideBuilder
 
 # site setup: your allocation code and the force field
 sed -i 's/#PBS -P CHANGE_ME/#PBS -P <your-allocation>/' submit_asyn_aa.pbs
+# (that edit makes the pbs line of md5sum -c report FAILED from now on --
+#  expected; the deployed copy is supposed to differ from the committed one)
 cp -r /path/to/a99SBdisp.ff .                # see docs/PROTOCOL.md
 
 # 1. smoke test FIRST: 1 replica x 1 ns, short/priority queue
@@ -112,6 +115,7 @@ launch_asyn_aa.py    node-local orchestrator: setup queue, GPU->replica map, ret
 setup_asyn_aa.py     build one replica: FF, box, solvent, ions, mdp files, state.json
 run_asyn_aa.py       run one replica: equilibration chain, chunked production
 build_start.py       fallback chain builder (OpenMM collapse + force screen)
+md5sums.txt          integrity check for cluster copies: md5sum -c md5sums.txt
 docs/PROTOCOL.md     the scientific protocol and its literature grounding
 docs/CLUSTER_NOTES.md the failure modes this pipeline is hardened against
 environment.yml      conda environment (builder fallback only)
