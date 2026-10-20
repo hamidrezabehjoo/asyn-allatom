@@ -12,9 +12,20 @@
 # Also: pbsdsh's stdout relay is lossy on some PBS Pro builds, so
 # everything is logged per node to pbsdsh_node<N>.log.
 TASK_DIR="${0%/*}"
-exec > "$TASK_DIR/pbsdsh_node${PBS_NODENUM:-x}.log" 2>&1
 set -euo pipefail
 source "$TASK_DIR/.pbsdsh_task_env"
+
+# Chunk-packing guard: if the scheduler ever places several chunks of this
+# job on ONE host (place=scatter should prevent it), every chunk spawns a
+# task here -- with the SAME PBS_NODENUM (host ordinal on this site).
+# Only the first task on each physical host may proceed; duplicates exit.
+# Without this, concurrent setups raced and tripled a topol.top (2026-10-20).
+HOST_LOCK="$REPO/.hostlock-$(hostname)"
+if ! mkdir "$HOST_LOCK" 2>/dev/null; then
+    echo "[task] duplicate task on $(hostname) (hostlock held) -- exiting"
+    exit 0
+fi
+exec > "$TASK_DIR/pbsdsh_node${PBS_NODENUM:-x}.log" 2>&1
 
 # TM strips the environment: replay the head node's binary AND library
 # paths. Without LD_LIBRARY_PATH the gmx binary exists but exits 127

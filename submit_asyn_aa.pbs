@@ -1,10 +1,16 @@
 #!/usr/bin/env bash
 #PBS -N asyn_aa
-#PBS -P 11004456
+#PBS -P CHANGE_ME        # your allocation/project code (or pass -P at qsub)
 #PBS -q normal
 #PBS -l select=1:ncpus=16:ngpus=2
 #PBS -l walltime=24:00:00
 #PBS -j oe
+# one chunk per PHYSICAL host: without this, PBS Pro packs chunks onto
+# shared nodes when they fit (observed 2026-10-20: 3 of 4 chunks landed on
+# one node), and pbsdsh then spawns multiple tasks with the SAME
+# PBS_NODENUM (it is the host ordinal on this site) -> concurrent setups
+# raced on the same replica dir and tripled topol.top's solvent count.
+#PBS -l place=scatter
 # ============================================================================
 # alpha-synuclein all-atom MD campaign (a99SB-disp / TIP4P-Disp, 16 nm box,
 # 300 K / 1 atm / 150 mM NaCl) -- NSCC ASPIRE 2B. Tuned from submit_panel3.sh.
@@ -51,7 +57,7 @@ case "$PHASE" in smoke|setup|run) ;; *)
     exit 2 ;;
 esac
 
-SCRATCH="${SCRATCH:-/scratch/users/industry/ism/behjoo}"
+SCRATCH="${SCRATCH:-$HOME/scratch}"
 ENV_PREFIX="${ENV_PREFIX:-$SCRATCH/conda-envs/asyn-aa}"   # see README: conda section
 REPO="${REPO:-$SCRATCH/asyn_allatom}"
 FF_DIR="${FF_DIR:-$REPO/a99SBdisp.ff}"
@@ -140,6 +146,7 @@ if [ "$NODES" -gt 1 ] && [ "$PHASE" != "smoke" ]; then
         printf "REPO='%s'\n" "$REPO"
     } > "$REPO/.pbsdsh_task_env"
     rm -f "$REPO"/.task_*.ok
+    rm -rf "$REPO"/.hostlock-*
     pbsdsh /bin/bash "$REPO/pbsdsh_task.sh"
     # this pbsdsh exits 0 even when tasks fail -> verify via sentinels
     n_ok=$(ls "$REPO"/.task_*.ok 2>/dev/null | wc -l)

@@ -1,0 +1,13 @@
+# Conda environment for asyn-allatom.
+# NOTE: OpenMM + PeptideBuilder are only exercised by build_start.py
+# (the fallback start-structure builder and its force screen). If all
+# replicas inherit start structures, the pipeline runs on GROMACS alone.
+name: asyn-aa
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - openmm=8.6
+  - pip
+  - pip:
+      - PeptideBuilder

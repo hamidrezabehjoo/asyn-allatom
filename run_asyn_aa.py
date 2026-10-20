@@ -20,7 +20,7 @@ Usage:
   python3 run_asyn_aa.py --replica 1
   python3 run_asyn_aa.py --replica 1 --maxh 23.5 --ntomp 8
 """
-import argparse, datetime, json, os, shutil, subprocess, sys, time
+import argparse, datetime, json, os, re, shutil, subprocess, sys, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -170,29 +170,50 @@ def main():
         mark_done(name)
 
     # ---- production (chunked, checkpoint-resumed) ---------------------------
-    if stage_done('prod'):
+    # Completion is grounded in the STEP COUNT parsed from prod.log, never
+    # in the string 'Finished mdrun': GROMACS prints that at EVERY graceful
+    # exit, including the -maxh chunk-boundary exits that are supposed to
+    # trigger the NEXT chunk. A string check marks every replica "done"
+    # after one ~maxh chunk (a fraction of the target) and the sentinel
+    # then skips the replica forever (2026-10-20 review).
+    def prod_step():
+        """Last step of the energy-table in prod.log (0 if none yet)."""
+        logf_path = os.path.join(rep, 'prod.log')
+        if not os.path.isfile(logf_path):
+            return 0
+        hits = re.findall(r'^\s*(\d+)\s+\d+\.\d+\s',
+                          open(logf_path, errors='ignore').read(), re.M)
+        return int(hits[-1]) if hits else 0
+
+    target = state['prod_steps']
+    if stage_done('prod') and prod_step() >= target:
         logline('[run] prod done already -- nothing to do')
         return
+    if stage_done('prod'):
+        logline(f'[run] WARNING: prod.done present but only {prod_step()}/'
+                f'{target} steps in prod.log -- removing the stale sentinel '
+                f'and resuming')
+        os.remove(os.path.join(rep, 'prod.done'))
     if not os.path.isfile(os.path.join(rep, 'prod.tpr')):
         sh([gmx, 'grompp', '-f', 'mdp/prod.mdp', '-c', 'npt2.gro',
             '-t', 'npt2.cpt', '-p', 'topol.top', '-o', 'prod.tpr',
             '-maxwarn', '1'])
-    target = state['prod_steps']
     chunk = 0
-    while True:
-        logf_path = os.path.join(rep, 'prod.log')
-        finished = (os.path.isfile(logf_path) and
-                    'Finished mdrun' in open(logf_path, errors='ignore').read())
-        if finished:
-            break
+    while prod_step() < target:
+        before = prod_step()
         chunk += 1
-        logline(f'[run] prod chunk {chunk} (target {target} steps)')
-        prog(stage='prod', chunk=chunk, target_steps=target)
+        logline(f'[run] prod chunk {chunk} ({before}/{target} steps done)')
+        prog(stage='prod', chunk=chunk, target_steps=target, steps_done=before)
         mdrun('prod', maxh=args.maxh)
         if args.dry_run:
             break
+        if prod_step() <= before:
+            sys.exit(f'[run] prod chunk {chunk} made no progress '
+                     f'({before}/{target} steps before and after mdrun) '
+                     f'-- see {logf.name}')
         if chunk > 10000:
             sys.exit('[run] absurd chunk count -- something is wrong')
+    logline(f'[run] prod target reached: {prod_step()}/{target} steps')
     mark_done('prod')
     hours = (time.time() - t_start) / 3600.0
     prog(stage='done', walltime_h=round(hours, 2))
