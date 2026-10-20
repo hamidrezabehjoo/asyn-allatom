@@ -161,4 +161,5 @@ al., *PLoS Comput. Biol.* 13:e1005659 (2017).
 
 ## License & author
 
-MIT (see LICENSE). Developed by Hamidreza Behjoo, on NSCC ASPIRE 2B.
+MIT (see LICENSE). Developed by Hamidreza Behjoo, Institute of Systems
+Medicine, CAMS Suzhou, on NSCC ASPIRE 2B.

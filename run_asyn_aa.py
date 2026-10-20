@@ -216,7 +216,8 @@ def main():
                 r = subprocess.run([gmx, 'check', '-e', 'prod.edr'],
                                    cwd=rep, capture_output=True, text=True,
                                    timeout=120)
-                m = re.findall(r'Last frame\s+\S+\s+time\s+([\d.]+)',
+                m = re.findall(r'Last\s+(?:energy\s+)?frame(?:\s+read)?'
+                               r'\s+\S+\s+time\s+([\d.]+)',
                                r.stdout + r.stderr)
                 if m:
                     last = max(last, int(float(m[-1]) / dt))
